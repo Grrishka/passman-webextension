@@ -1,0 +1,174 @@
+1) Langage du projet
+
+Le projet est principalement en Svelte + TypeScript.
+
+Preuves dans le dépôt :
+- Le README dit explicitement : “It uses Svelte for the UI and TypeScript throughout.”
+- La composition réelle du dépôt est ~49.5% Svelte et ~47.6% TypeScript.
+
+Voici la source la plus directe :
+```md name=README.md url=https://github.com/nextcloud/passman-webextension/blob/master/README.md
+This is a modern, fully rewritten browser extension for the Passman Nextcloud app, using the WXT framework.
+
+It uses Svelte for the UI and TypeScript throughout.
+```
+
+Et la structure du dépôt confirme ça :
+```ts name=src/services/ExtensionSettingsService.ts url=https://github.com/nextcloud/passman-webextension/blob/master/src/services/ExtensionSettingsService.ts
+export interface ExtensionSettings {
+    [ExtensionSettingsOptions.nextcloudServerConnections]: NextcloudServerInfoInterface[],
+    [ExtensionSettingsOptions.activeConnectionId]: string,
+    [ExtensionSettingsOptions.defaultVaultInfoByConnection]: Record<string, DefaultVaultInfo>,
+    ...
+}
+```
+
+Donc, si tu veux participer : le code principal est en TypeScript, avec l’UI Svelte.
+
+2) Ce qu’il faut comprendre pour la fonctionnalité “plusieurs coffres sur le même serveur Nextcloud”
+
+Oui : le point clé est que le code actuel est structuré pour gérer plusieurs serveurs, mais pas encore plusieurs coffres “dans un même serveur” comme un vrai multi-vault.
+
+Le cœur du modèle actuel :
+```ts name=src/services/ServerConnectionDirectoryService.ts url=https://github.com/nextcloud/passman-webextension/blob/master/src/services/ServerConnectionDirectoryService.ts
+export interface ConnectionDirectory {
+    connections: NextcloudServerInfoInterface[];
+    activeConnectionId: string | null;
+}
+```
+
+Puis :
+```ts name=src/services/ServerConnectionDirectoryService.ts url=https://github.com/nextcloud/passman-webextension/blob/master/src/services/ServerConnectionDirectoryService.ts
+const vaultInfoByConnection = extensionSettings[ExtensionSettingsOptions.defaultVaultInfoByConnection] ?? {};
+...
+settings[ExtensionSettingsOptions.defaultVaultInfoByConnection] = vaultInfoByConnection;
+```
+
+Et plus loin :
+```ts name=src/services/ServerConnectionDirectoryService.ts url=https://github.com/nextcloud/passman-webextension/blob/master/src/services/ServerConnectionDirectoryService.ts
+public static setDefaultVaultForActiveConnection = async (vaultInfo: DefaultVaultInfo): Promise<void> => {
+    const activeConnectionId = settings[ExtensionSettingsOptions.activeConnectionId];
+    ...
+    vaultByConnection[activeConnectionId] = vaultInfo;
+    settings[ExtensionSettingsOptions.defaultVaultInfoByConnection] = vaultByConnection;
+    settings[ExtensionSettingsOptions.defaultVaultInfo] = vaultInfo;
+}
+```
+
+Autrement dit :
+- une “connection” = un serveur/user/token
+- un “default vault” = un coffre unique par connection
+- il n’y a pas de structure “plusieurs vaults pour la même connection” encore
+
+Ce qui est déjà prêt dans le code :
+```ts name=src/entrypoints/background/messages/probeServerConnection.ts url=https://github.com/nextcloud/passman-webextension/blob/master/src/entrypoints/background/messages/probeServerConnection.ts
+const client = await BackendPassmanClient.createInstance(serverData);
+const loginOk = await client.preloadVaults(true);
+
+for (const preloadedVault of client.preloadedVaults) {
+    vaultSelectionList.push({
+        guid: preloadedVault.guid,
+        name: preloadedVault.name,
+    });
+}
+```
+
+Et aussi :
+```ts name=src/entrypoints/background/messages/addNewServerConnection.ts url=https://github.com/nextcloud/passman-webextension/blob/master/src/entrypoints/background/messages/addNewServerConnection.ts
+if (await connection.preloadVaults(true)) {
+    ...
+    await ServerConnectionDirectoryService.upsertServerConnection(...)
+}
+```
+
+Cela montre que le backend sait déjà récupérer la liste des coffres pour un serveur. Le manque principal, c’est la persistance et l’UI de sélection multiple pour un même serveur.
+
+Les bases à maîtriser pour travailler localement
+
+1. Architecture du stockage des connexions
+- `src/services/ExtensionSettingsService.ts`
+- `src/services/ServerConnectionDirectoryService.ts`
+
+C’est le point central de la persistance.
+
+2. Cycle de vie du client Passman
+- `src/services/PassmanClientService.ts`
+- `src/lib/BackendPassmanClient.ts`
+
+C’est là que sont chargés les serveurs et les connexions.
+
+3. Messages background / UI
+- `src/entrypoints/background/messages/addNewServerConnection.ts`
+- `src/entrypoints/background/messages/listServerConnections.ts`
+- `src/entrypoints/background/messages/probeServerConnection.ts`
+
+Ils montrent comment le navigateur et le background communiquent.
+
+4. Sélection de vault par défaut
+- `src/entrypoints/background/messages/setDefaultVault.ts`
+- `src/services/ServerConnectionDirectoryService.ts`
+
+C’est le point exact à modifier pour supporter plusieurs coffres par serveur.
+
+5. UI de settings
+- `src/spa_components/Settings/Settings.svelte`
+- `src/spa_components/Settings/NextcloudServerSettings.svelte` (si présent dans le repo)
+- `src/spa_components/Settings/LegacySettingsMigrate.svelte`
+
+Le front doit afficher une sélection de coffre non plus “1 par serveur”, mais “N par serveur”.
+
+Ce qu’il faudrait changer pour le feature
+
+En pratique, le vrai besoin est :
+
+- garder une liste de serveurs (déjà fait)
+- pour chaque serveur, garder une liste de coffres associés
+- sélectionner un vault actif par serveur
+- utiliser cette sélection dans les appels “get vault / get credentials / autofill”
+- adapter la persistence `defaultVaultInfoByConnection` vers quelque chose de plus explicite, par ex. :
+  - `vaultsByConnection: Record<connectionId, Array<{guid,name,password}>>`
+  - `activeVaultGuidByConnection: Record<connectionId, string>`
+
+Et les changements correspondants dans :
+- `ServerConnectionDirectoryService`
+- `ExtensionSettingsService`
+- `PassmanClientService`
+- les messages background
+- l’UI de serveur / sélection de vault
+
+Ce qui est déjà bien avancé
+- La logique de multi-connexion serveur est là.
+- La découverte de plusieurs vaults sur le même serveur est déjà présente dans le code (`preloadedVaults`).
+- Le point bloquant est surtout la modélisation et la persistance de la sélection multi-vault.
+
+Pour travailler chez toi : les prérequis de dev
+Le README donne les bases :
+```md name=README.md url=https://github.com/nextcloud/passman-webextension/blob/master/README.md
+### Getting Started
+
+#### Precondition: Get bun installed
+Take a look at to documentation for installation instructions: https://bun.sh/docs/installation
+
+Bun is the recommended package manager for this project, but something like pnpm should also work well.
+
+#### Install dependencies
+bun install
+
+#### Run the development server
+bun run dev
+```
+
+Donc en résumé :
+
+- Installer Bun
+- `bun install`
+- `bun run dev`
+- comprendre les fichiers listés ci-dessus
+- commencer par remplacer le schéma “un vault par connection” par “N vaults par connection”
+
+Si tu veux, je peux te proposer un plan de développement très concret pour cette feature, petit par petit :
+- modèle de données
+- migration des settings
+- API/messages
+- UI
+- tests / validation.
